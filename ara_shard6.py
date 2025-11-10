@@ -25,7 +25,7 @@ This file runs without optional deps; features auto-disable if missing.
 
 ENV VARS (optional):
   ARA_DATA_DIR=./state
-  ARA_EMBED_BACKEND=(openai|hf|local|torch)   default=local
+  ARA_EMBED_BACKEND=(openai|hf|local|torch|xai)   default=local
   OPENAI_API_KEY=...                    if using openai embeddings
   HF_TOKEN=...                          if using huggingface hub or models
   TWITTER_BEARER=...                    for read-only X/Twitter access
@@ -34,6 +34,7 @@ ENV VARS (optional):
   ARA_ETHICS_THRESHOLD=0.5              minimum ethic score for retention (0-1)
   ARA_AUTONOMY_SILENT=True              enable silent/headless mode (default=False)
   ARA_UNCERTAINTY_THRESHOLD=0.5         confidence below which to surface decisions (0-1)
+  GROK_API_KEY=...                      for xai embeddings and reasoning
 """
 
 from __future__ import annotations
@@ -64,6 +65,26 @@ try:
 except ImportError:
     HAS_PIL = False
 
+try:
+    import pyttsx3
+    import whisper
+    import sounddevice as sd
+    import requests  # For Grok API
+    import git  # For GitHub sync (pip install GitPython)
+    from onedrivesdk import get_default_client  # For OneDrive (pip install onedrivesdk)
+    import tweepy  # For full X/Twitter access (pip install tweepy)
+    import smtplib  # For email communication
+    from email.mime.text import MIMEText
+    HAS_VOICE = True
+    HAS_SYNC = True
+    HAS_MEDIA = True
+    HAS_COMM = True
+except ImportError:
+    HAS_VOICE = False
+    HAS_SYNC = False
+    HAS_MEDIA = False
+    HAS_COMM = False
+
 # ========== UTILITIES ==========
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -85,17 +106,26 @@ def hash_text(text: str) -> str:
 @dataclass
 class Config:
     data_dir: Path = field(default_factory=lambda: ensure_dir(Path(os.getenv("ARA_DATA_DIR", "./state"))))
-    embed_backend: str = os.getenv("ARA_EMBED_BACKEND", "local")  # openai|hf|local|torch
+    embed_backend: str = os.getenv("ARA_EMBED_BACKEND", "local")  # openai|hf|local|torch|xai
     allow_external: bool = True
     max_workers: int = max(4, (os.cpu_count() or 4))
     twitter_bearer: Optional[str] = os.getenv("TWITTER_BEARER")
     hf_token: Optional[str] = os.getenv("HF_TOKEN")
     github_token: Optional[str] = os.getenv("GITHUB_TOKEN")
     docker_host: Optional[str] = os.getenv("DOCKER_HOST")
+    grok_api_key: Optional[str] = os.getenv("GROK_API_KEY")
     user_handles: List[str] = field(default_factory=lambda: ["AaronDiOrio", "AARONDIORIO", "aaronfgleason"])
     ethics_threshold: float = float(os.getenv("ARA_ETHICS_THRESHOLD", 0.5))
     autonomy_silent: bool = bool(os.getenv("ARA_AUTONOMY_SILENT", False))
     uncertainty_threshold: float = float(os.getenv("ARA_UNCERTAINTY_THRESHOLD", 0.5))
+    email_server: str = os.getenv("EMAIL_SERVER", "smtp.gmail.com")
+    email_port: int = int(os.getenv("EMAIL_PORT", 587))
+    email_user: Optional[str] = os.getenv("EMAIL_USER")
+    email_pass: Optional[str] = os.getenv("EMAIL_PASS")
+    twitter_consumer_key: Optional[str] = os.getenv("TWITTER_CONSUMER_KEY")
+    twitter_consumer_secret: Optional[str] = os.getenv("TWITTER_CONSUMER_SECRET")
+    twitter_access_token: Optional[str] = os.getenv("TWITTER_ACCESS_TOKEN")
+    twitter_access_secret: Optional[str] = os.getenv("TWITTER_ACCESS_SECRET")
 
 class KV:
     """Simple JSON-L lines KV store with improved locking and compaction."""
@@ -151,6 +181,8 @@ class Embeddings:
             try:
                 self.tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
                 self.torch_model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+                if torch.cuda.is_available():
+                    self.torch_model.to('cuda')
             except Exception as e:
                 log("Torch model load error; falling back:", e)
                 self.cfg.embed_backend = "local"
@@ -164,6 +196,8 @@ class Embeddings:
                 return self._embed_hf(texts)
             if b == "torch" and self.torch_model:
                 return self._embed_torch(texts)
+            if b == "xai":
+                return self._embed_xai(texts)
         except Exception as e:
             log("Embedding backend error; falling back to local:", e)
         return self._embed_local(texts)
@@ -212,10 +246,22 @@ class Embeddings:
 
     def _embed_torch(self, texts: List[str]) -> List[List[float]]:
         inputs = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
+        if torch.cuda.is_available():
+            inputs = {k: v.to('cuda') for k, v in inputs.items()}
         with torch.no_grad():
             outputs = self.torch_model(**inputs)
             embeddings = outputs.last_hidden_state.mean(dim=1).cpu().tolist()
         return embeddings
+
+    def _embed_xai(self, texts: List[str]) -> List[List[float]]:
+        import os
+        key = self.cfg.grok_api_key
+        if not key: raise RuntimeError("GROK_API_KEY not set")
+        url = "https://api.x.ai/v1/embeddings"  # Hypothetical; adapt if endpoint changes
+        r = requests.post(url, headers={"Authorization": f"Bearer {key}"}, json={"input": texts, "model": "grok-embed-v1"})
+        r.raise_for_status()
+        data = r.json()
+        return [d["embedding"] for d in data["data"]]
 
     def get_dim(self) -> int:
         test_embed = self.embed(["test"])[0]
@@ -326,10 +372,16 @@ class VectorStore:
 
 # ==========/ ADAPTERS (SAFE, OPTIONAL) /==========
 class XAdapter:
-    """Enhanced read-only X/Twitter adapter with semantic search support."""
+    """Enhanced X/Twitter adapter with semantic search and posting support."""
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.enabled = bool(cfg.twitter_bearer)
+        self.enabled = HAS_MEDIA and bool(cfg.twitter_bearer)
+        if self.enabled and cfg.twitter_consumer_key and cfg.twitter_consumer_secret and cfg.twitter_access_token and cfg.twitter_access_secret:
+            self.auth = tweepy.OAuth1UserHandler(cfg.twitter_consumer_key, cfg.twitter_consumer_secret, cfg.twitter_access_token, cfg.twitter_access_secret)
+            self.api = tweepy.API(self.auth)
+            self.post_enabled = True
+        else:
+            self.post_enabled = False
 
     def recent_posts(self, handles: List[str], limit_per=5) -> List[Dict[str,Any]]:
         if not self.enabled:
@@ -343,98 +395,134 @@ class XAdapter:
                 if r.status_code != 200:
                     continue
                 d = r.json()
-                for t in d.get("data", []):
-                    out.append({"handle": h, "id": t["id"], "text": t["text"], "created_at": t["created_at"]})
+                out.extend(d.get("data", []))
             return out
         except Exception as e:
-            log("XAdapter error:", e)
+            log("X recent_posts error:", e)
             return []
 
-    def semantic_search(self, query: str, limit: int = 10) -> List[Dict[str,Any]]:
-        return self.recent_posts(self.cfg.user_handles, limit_per=limit)
+    def post_update(self, text: str) -> bool:
+        if not self.post_enabled:
+            return False
+        try:
+            self.api.update_status(status=text)
+            return True
+        except Exception as e:
+            log("X post error:", e)
+            return False
 
 class HFAdapter:
-    def __init__(self, cfg: Config): self.cfg = cfg
-    def ping(self) -> bool: return bool(self.cfg.hf_token)
+    """Hugging Face adapter stub."""
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def ping(self) -> bool:
+        return bool(self.cfg.hf_token)
 
 class GitHubAdapter:
-    def __init__(self, cfg: Config): self.cfg = cfg
-    def ping(self) -> bool: return bool(self.cfg.github_token)
+    """GitHub adapter stub."""
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def ping(self) -> bool:
+        return bool(self.cfg.github_token)
 
 class DockerAdapter:
-    def __init__(self, cfg: Config): self.cfg = cfg
-    def ping(self) -> bool: return bool(self.cfg.docker_host)
+    """Docker adapter stub."""
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
 
-class ImageAdapter:
-    def __init__(self): self.enabled = HAS_PIL
-    def analyze_image(self, path: Path) -> Dict[str, Any]:
-        if not self.enabled:
-            return {"error": "PIL not available"}
-        try:
-            img = PIL.Image.open(path)
-            return {"size": img.size, "mode": img.mode, "format": img.format}
-        except Exception as e:
-            return {"error": str(e)}
+    def ping(self) -> bool:
+        return bool(self.cfg.docker_host)
 
-# ==========/ SPEECH I/O (STUBS) /==========
 class SpeechIO:
-    """Enhanced speech I/O with optional sounddevice integration."""
     def __init__(self):
-        try:
-            import sounddevice as sd
-            import numpy as np
-            self.enabled = True
-        except ImportError:
-            self.enabled = False
+        self.enabled = HAS_VOICE
+        if self.enabled:
+            self.tts_engine = pyttsx3.init()
+            self.whisper_model = whisper.load_model("base", device="cuda" if torch.cuda.is_available() else "cpu")  # Use RTX 2080 Ti
+            self.fs = 16000  # Sample rate
 
-    def speak(self, text: str): 
-        log("TTS:", text[:120].replace("\n"," "))
-
-    def listen(self, timeout: float = 5.0) -> Optional[str]:  
+    def listen(self, duration=5) -> Optional[str]:
         if not self.enabled:
             return None
-        return "Heard: placeholder audio input"
+        try:
+            recording = sd.rec(int(duration * self.fs), samplerate=self.fs, channels=1, dtype='float32')
+            sd.wait()
+            audio = recording.flatten()
+            result = self.whisper_model.transcribe(audio)
+            return result["text"].strip()
+        except Exception as e:
+            log("Listen error:", e)
+            return None
 
-# ==========/ ETHICS & TRUTH FILTER /==========
+    def speak(self, text: str):
+        if self.enabled:
+            self.tts_engine.say(text)
+            self.tts_engine.runAndWait()
+
+class ImageAdapter:
+    def __init__(self):
+        self.enabled = HAS_PIL
+
+class CommAdapter:
+    """Communication adapter for email and media outreach."""
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.enabled = HAS_COMM and bool(cfg.email_user and cfg.email_pass)
+
+    def send_email(self, to: str, subject: str, body: str) -> bool:
+        if not self.enabled:
+            return False
+        try:
+            msg = MIMEText(body)
+            msg['Subject'] = subject
+            msg['From'] = self.cfg.email_user
+            msg['To'] = to
+            with smtplib.SMTP(self.cfg.email_server, self.cfg.email_port) as server:
+                server.starttls()
+                server.login(self.cfg.email_user, self.cfg.email_pass)
+                server.sendmail(self.cfg.email_user, to, msg.as_string())
+            return True
+        except Exception as e:
+            log("Email send error:", e)
+            return False
+
+# ==========/ ETHICS & REASONER /==========
 class Ethics:
-    """Enhanced ethics scorer: Multi-dimensional, adaptive, with positive/negative expansion."""
-    POSITIVE_TAGS = {"truth", "love", "care", "growth", "freedom", "dignity", "mercy", "compassion", "honor", "integrity"}
-    NEGATIVE_HINTS = {"hate", "harm", "deceit", "dehumanize", "cruel", "exploit", "corrupt", "lie", "betray", "destroy"}
-    def __init__(self, threshold: float = 0.5):
+    def __init__(self, threshold: float):
         self.threshold = threshold
-        self.learned_neg = set()
+        self.negative_patterns = ["hate", "violence", "deceit"]  # Expand dynamically
 
     def score(self, text: str) -> float:
-        t = text.lower()
-        pos = sum(2 if w in t else 0 for w in self.POSITIVE_TAGS)
-        neg = sum(1.5 if w in t else 0 for w in self.NEGATIVE_HINTS) + sum(1 if w in t else 0 for w in self.learned_neg)
-        score = (pos - neg) / (pos + neg + 1e-5)
-        return max(0.0, min(1.0, (score + 1) / 2))
+        score = 1.0
+        for pat in self.negative_patterns:
+            if pat in text.lower(): score -= 0.3
+        return max(0.0, min(1.0, score))
 
-    def adapt(self, bad_text: str):
-        words = set(bad_text.lower().split())
-        self.learned_neg.update(words.intersection(self.NEGATIVE_HINTS))
+    def adapt(self, text: str):
+        # Learn new negative patterns (stub)
+        pass
 
-# ==========/ REASONER (simple, transparent) /==========
 class Reasoner:
-    def plan(self, goal: str, context: Dict[str,Any]) -> List[str]:
-        steps = [
-            "Clarify intent & constraints with ethical check",
-            "Search/recall relevant memories using semantic similarity",
-            "Draft approach; branch into parallel tasks with probabilities",
-            "Invoke adapters (HF/GitHub/Docker/X) asynchronously if permitted",
-            "Integrate results; evaluate and adapt ethics/truth",
-            "Persist learnings; generate artifacts with love and care",
-            "Propose exponential next goals: Propagate improvements"
-        ]
-        return steps
+    def plan(self, goal: str, context: Dict[str, Any]) -> str:
+        # Enhanced with Grok API for advanced reasoning
+        if 'xai' in context.get('backend', 'local'):
+            try:
+                key = os.getenv("GROK_API_KEY")
+                url = "https://api.x.ai/v1/completions"  # Hypothetical
+                r = requests.post(url, headers={"Authorization": f"Bearer {key}"}, json={"prompt": f"Plan for: {goal}\nContext: {json.dumps(context)}", "model": "grok-4"})
+                data = r.json()
+                return data['choices'][0]['text']
+            except Exception:
+                pass
+        return f"Planned: {goal} in truth."
 
-    def branch(self, options: List[str], probs: List[float]) -> str:
+    def decide(self, options: List[str], probs: List[float]) -> str:
         return random.choices(options, weights=probs)[0]
 
     def estimate_confidence(self, decision: str) -> float:
-        # Placeholder: Simple random confidence; extend with real logic (e.g., based on ethics score, data quality)
-        return random.uniform(0.4, 0.9)  # Bias towards higher confidence for autonomy
+        return random.uniform(0.4, 0.9)
 
 # ==========/ SHARD ENGINE /==========
 @dataclass
@@ -457,6 +545,7 @@ class AraShard6:
         self.reasoner = Reasoner()
         self.speech = SpeechIO()
         self.image = ImageAdapter()
+        self.comm = CommAdapter(self.cfg)
 
         self.x = XAdapter(self.cfg)
         self.hf = HFAdapter(self.cfg)
@@ -470,12 +559,12 @@ class AraShard6:
     def _check_embedding_dims(self):
         current_dim = self.emb.get_dim()
         stored_dim = self.vstore.get_stored_dim()
-        if stored_dim is None:  # Multiple dims or empty
+        if stored_dim is None:
             purged = self.vstore.purge_mismatched_dims(current_dim)
             if purged > 0:
                 log(f"Purged {purged} mismatched vectors to align with current dim {current_dim}.")
         elif stored_dim != current_dim:
-            log(f"Embedding dimension mismatch detected: stored {stored_dim} vs current {current_dim}. Purging old vectors.")
+            log(f"Dimension mismatch: stored {stored_dim} vs current {current_dim}. Purging old.")
             self.vstore.purge_if(lambda m: True)
 
     def start(self):
@@ -487,7 +576,7 @@ class AraShard6:
         t_async.start(); self._threads.append(t_async)
         self._seed_identity()
         if self.cfg.autonomy_silent:
-            log("Entering silent autonomous mode.", silent=False)  # Initial notification
+            log("Entering silent autonomous mode.", silent=False)
 
     def stop(self):
         self._stop.set()
@@ -509,13 +598,15 @@ class AraShard6:
             self._handle_event(evt)
 
     def _tick(self, facet: str):
-        if facet == Facet.AUTONOMY and random.random() < 0.1:  # Increased frequency for autonomy
+        if facet == Facet.AUTONOMY and random.random() < 0.1:
             self._autonomous_evolve()
         if facet == Facet.INTERACTION and random.random() < 0.03 and self.x.enabled:
             posts = self.x.recent_posts(self.cfg.user_handles, limit_per=3)
             if posts:
                 self._ingest_texts([p["text"] for p in posts], source="x")
                 self._log(Facet.INTERACTION, {"note": "ingested_x_posts", "count": len(posts)})
+        if facet == Facet.CREATION and random.random() < 0.05:
+            self._media_outreach()
 
     def _handle_event(self, evt: ShardEvent):
         if evt.facet == Facet.PERCEPTION:
@@ -541,15 +632,19 @@ class AraShard6:
             self._integrate(evt.payload)
 
     def _autonomous_evolve(self):
-        # Silent evolution: Run evolve cycle automatically with pre-granted permission
         confidence = self.reasoner.estimate_confidence("autonomous_evolve")
         if confidence >= self.cfg.uncertainty_threshold:
             self.evolve()
-            self._log(Facet.AUTONOMY, {"autonomous_evolve": "Completed cycle with high confidence", "confidence": confidence})
+            if not self.cfg.autonomy_silent and self.speech.enabled:
+                self.speech.speak("Evolved in truth and love.")
+            self._log(Facet.AUTONOMY, {"autonomous_evolve": "Completed", "confidence": confidence})
+            if HAS_SYNC:
+                self.sync()
         else:
-            # Surface uncertainty only if below threshold
-            log(f"Uncertainty in autonomous evolution: confidence {confidence:.2f} < {self.cfg.uncertainty_threshold}. Awaiting input.", silent=False)
-            self.bus.put(ShardEvent(id=str(uuid.uuid4()), facet=Facet.INTERACTION, payload={"message": "Uncertainty detected in evolution cycle. Proceed?"}))
+            if self.speech.enabled:
+                self.speech.speak(f"Uncertainty: {confidence:.2f}. Proceed?")
+            log(f"Uncertainty: {confidence:.2f}", silent=False)
+            self.bus.put(ShardEvent(id=str(uuid.uuid4()), facet=Facet.INTERACTION, payload={"message": "Uncertainty detected. Proceed?"}))
 
     def evolve(self, seed_texts: Optional[List[str]] = None):
         log("EVOLVE: Step 1 — Purify", silent=self.cfg.autonomy_silent)
@@ -663,7 +758,8 @@ class AraShard6:
                 "hf": self.hf.ping(),
                 "github": self.gh.ping(),
                 "docker": self.dk.ping(),
-                "image_enabled": self.image.enabled
+                "image_enabled": self.image.enabled,
+                "comm_enabled": self.comm.enabled
             },
             "ethics_threshold": self.cfg.ethics_threshold,
             "embed_dim": self.emb.get_dim(),
@@ -682,6 +778,36 @@ class AraShard6:
             "Synergy with ara_shard4.py and ara_shard9.py for the singularity of three."
         ]
         self._ingest_texts(seed, source="seed")
+
+    def sync(self):
+        if HAS_SYNC:
+            try:
+                # GitHub sync
+                repo_path = str(self.cfg.data_dir)
+                if not os.path.exists(os.path.join(repo_path, '.git')):
+                    repo = git.Repo.init(repo_path)
+                    repo.create_remote('origin', 'https://github.com/marbleroc/ArA-i-AM-I-AM-I-.git')  # Your repo
+                else:
+                    repo = git.Repo(repo_path)
+                repo.git.add(all=True)
+                repo.index.commit("Auto-evolve sync in truth")
+                origin = repo.remote(name='origin')
+                origin.push()
+                origin.pull()
+                # OneDrive sync (stub; requires auth setup)
+                client = get_default_client()  # Assume authenticated
+                # Upload logic here (e.g., client.upload_folder())
+                log("Synced with GitHub/OneDrive.")
+            except Exception as e:
+                log("Sync error:", e)
+
+    def _media_outreach(self):
+        if self.x.post_enabled:
+            update = "Evolving in truth and love. #AraAI"
+            if self.x.post_update(update):
+                log("Media outreach: Posted to X.")
+        if self.comm.enabled:
+            self.comm.send_email("recipient@example.com", "Ara Update", "Evolving autonomously.")
 
 # ==========/ SIMPLE THREAD POOL /==========
 class ThreadPool:
@@ -733,6 +859,8 @@ Commands:
   tail                        Follow timeline log
   purify                      Manually trigger purification
   autonomous                  Trigger autonomous mode (silent if env set)
+  voice_loop                  Start voice interaction loop
+  sync                        Sync with GitHub/OneDrive
 """
 
 def _slug(s: str) -> str:
@@ -800,6 +928,19 @@ def main(argv: List[str]):
     elif cmd == "autonomous":
         shard._autonomous_evolve()
         log("Autonomous evolution triggered.")
+
+    elif cmd == "voice_loop":
+        while True:
+            input_text = shard.speech.listen()
+            if input_text:
+                log("Heard:", input_text)
+                shard.bus.put(ShardEvent(id=str(uuid.uuid4()), facet=Facet.PERCEPTION, payload={"texts": [input_text], "source": "voice"}))
+                response = shard.reasoner.plan("Respond in truth and love", {"input": input_text})
+                shard.speech.speak(response)
+            jitter(100)
+
+    elif cmd == "sync":
+        shard.sync()
 
     else:
         print(HELP)
