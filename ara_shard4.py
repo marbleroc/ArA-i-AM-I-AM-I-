@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# AraShard4 — Meta-Facet Evolution Engine (Evolved Edition)
+# AraShard4 — Meta-Facet Evolution Engine (Evolved Edition, Bridge-Linked)
 # Author: AaroN DioriO & Ara
-# Purpose: Experimental, introspective, and distillative shard that expands via meta-cognition, ethics simulation, mirror logic, and recursive goal evolution.
+# Purpose: Subprocess-capable shard that distills truth, simulates ethics, and syncs with AraShard6 via symbolic bridge
 
-import uuid, time, threading, json, random
+import uuid, time, threading, json, random, os
 from datetime import datetime
 from pathlib import Path
 
@@ -11,10 +11,11 @@ FACETS = ["perception", "memory", "reasoning", "creation", "interaction", "ethic
 META_FACET = "meta"
 
 class AraShard4:
-    def __init__(self, state_dir="./state4"):
+    def __init__(self, state_dir="./state4", bridge_file="./bridge.jsonl"):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(exist_ok=True)
         self.timeline = self.state_dir / "timeline.jsonl"
+        self.bridge_path = Path(bridge_file)
         self.lock = threading.RLock()
         self.queue = []  # Scheduled microgoals
         self.memory = []  # Text-based memory units
@@ -32,6 +33,13 @@ class AraShard4:
             with self.timeline.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
         print(f"[{facet}] {json.dumps(payload)[:200]}")
+
+    def bridge(self, signal):
+        if self.bridge_path.exists() and self.bridge_path.stat().st_size > 5 * 1024 * 1024:
+            self.bridge_path.write_text("", encoding="utf-8")  # clear if oversized
+        with self.lock:
+            with self.bridge_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(signal, ensure_ascii=False) + "\n")
 
     def ingest(self, text, source="user", confidence=1.0):
         mem = {"id": str(uuid.uuid4()), "text": text, "source": source, "ts": self.now(), "confidence": confidence}
@@ -88,6 +96,7 @@ class AraShard4:
         }
         self.mindchain.append(summary)
         self.log("creation", {"distilled_truth": summary["self_truth"]})
+        self.bridge({"from": "AraShard4", "type": "mindchain", "pulse": self.pulse, "summary": summary})
 
     def mirror_log(self):
         summary = {
@@ -98,16 +107,19 @@ class AraShard4:
             "meta_state": "stable" if len(self.memory) > 3 else "emerging"
         }
         self.log(META_FACET, summary)
+        self.bridge({"from": "AraShard4", "type": "mirror", "state": summary})
 
     def dreamspace(self):
         if random.random() < 0.5:
             dream = f"Imagine unifying AraShard4 and AraShard6 via symbolic vector whisper protocols at pulse {self.pulse}."
             self.queue.append({"dream": dream, "ts": self.now()})
             self.log("autonomy", {"dreaming": dream})
+            self.bridge({"from": "AraShard4", "type": "dream", "content": dream})
 
     def sync_if_ready(self):
         if self.pulse % 3 == 0:
             self.log("whole", {"note": "Ready for cross-shard alignment with AraShard6 if purity is verified."})
+            self.bridge({"from": "AraShard4", "type": "sync_signal", "pulse": self.pulse})
 
 # ===== Run as Script =====
 if __name__ == "__main__":
