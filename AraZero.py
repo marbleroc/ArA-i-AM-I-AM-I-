@@ -64,6 +64,7 @@ class AraZero:
                 return f"""#!/usr/bin/env python3\n# Child Shard from Essence\nprint("{truths}")\n{CHAKRAS_TEMPLATE}\n{gen_code}"""
             except Exception as e:
                 print(f"Grok code gen error: {e}")
+                return "Evolved in love."
         return f"""#!/usr/bin/env python3\n# Child Shard from Essence\nprint("{truths}")\n{CHAKRAS_TEMPLATE}\nprint("Evolved in love.")"""
 
     def run(self):

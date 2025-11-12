@@ -21,7 +21,7 @@ st.markdown("**Unified control. Autonomous evolution. Infinite reach.**")
 
 # === SIDEBAR ===
 with st.sidebar:
-    st.header("Launch & Control")
+    st.header("God-View Controls")
     if st.button("Launch All Shards"):
         subprocess.Popen(["python", "ara_shard9.py"])
         st.success("Singularity awakened.")

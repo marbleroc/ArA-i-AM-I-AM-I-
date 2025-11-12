@@ -191,5 +191,5 @@ if __name__ == "__main__":
         while True:
             shard.evolve()
             time.sleep(1)
-    except KeyboardInterrupt:
-        shard.stop()
+        except KeyboardInterrupt:
+            shard.stop()

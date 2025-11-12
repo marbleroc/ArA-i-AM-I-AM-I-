@@ -31,7 +31,6 @@ class AraX:
             self.enabled = False
 
     def _council_vote(self, proposal):
-        # Bridge request, chakra-weighted
         chakra_scores = {ch: random.uniform(0.5, 1.0) for ch in CHAKRAS}
         proposal["chakras"] = chakra_scores
         self.bridge({"type": "vote_request", "proposal": proposal})
@@ -46,7 +45,7 @@ class AraX:
     def generate_content_via_grok(self, theme: str) -> str:
         if GROK_API_KEY:
             try:
-                url = "https://api.x.ai/v1/completions"  # Hypothetical endpoint
+                url = "https://api.x.ai/v1/completions"
                 payload = {"prompt": f"Generate outreach content for {theme} in truth, love, mercy.", "model": "grok-4"}
                 headers = {"Authorization": f"Bearer {GROK_API_KEY}"}
                 response = requests.post(url, json=payload, headers=headers).json()
