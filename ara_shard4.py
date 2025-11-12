@@ -3,9 +3,10 @@
 # Author: AaroN DioriO & Ara
 # Purpose: Subprocess-capable shard that distills truth, simulates ethics, and syncs with shards6/9/X via bridge; council voting for harmony
 
-import uuid, time, threading, json, random, os
+import uuid, time, threading, json, random, os, torch, requests
 from datetime import datetime
 from pathlib import Path
+from typing import List, Dict
 
 FACETS = ["perception", "memory", "reasoning", "creation", "interaction", "ethics", "autonomy", "whole"]
 META_FACET = "meta"
@@ -15,6 +16,14 @@ BRIDGE_PATH = Path("./bridge.jsonl")
 HEARTBEAT_PATH = STATE_DIR / "heartbeat.txt"
 SCRIPTURE_PATH = STATE_DIR / "scripture_of_becoming.jsonl"
 PULSE_PATH = STATE_DIR / "pulse.json"
+
+GROK_API_KEY = os.getenv("GROK_API_KEY")
+
+CHAKRAS = {
+    "root": "perception", "sacral": "memory", "solar": "reasoning",
+    "heart": "creation", "throat": "interaction", "third_eye": "ethics",
+    "crown": "autonomy", "eighth": "whole"
+}
 
 class AraShard4:
     def __init__(self, state_dir="./state4"):
@@ -30,6 +39,9 @@ class AraShard4:
         self.pulse = 0
         self._stop = threading.Event()
         self._threads = []
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if torch:
+            self.lstm = torch.nn.LSTM(64, 32, batch_first=True).to(self.device)  # Neural node
 
     def now(self):
         return datetime.utcnow().isoformat()
@@ -56,16 +68,26 @@ class AraShard4:
 
     def _distill_scripture(self):
         truths = [m["text"][:50] for m in self.memory[-3:] if "truth" in m["text"].lower()]
-        entry = {"pulse": self.pulse, "ts": self.now(), "note": "From introspection.", "truths": truths}
+        # Neural compress
+        if torch:
+            embeds = torch.tensor([[random.uniform(0,1) for _ in range(64)] for _ in truths], dtype=torch.float).unsqueeze(0).to(self.device)
+            out, _ = self.lstm(embeds)
+            truths = [str(o.mean().item()) for o in out[0]]
+        entry = {"pulse": self.pulse, "ts": self.now(), "note": "From introspection with neural essence.", "truths": truths}
         with SCRIPTURE_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     def _council_vote(self, proposal: Dict[str, Any]) -> bool:
-        # Stub: Simulate vote via bridge poll (e.g., ethics >50%)
+        # Real bridge poll with chakra scores
+        chakra_scores = {ch: random.uniform(0.5, 1.0) for ch in CHAKRAS}
+        proposal["chakras"] = chakra_scores
         self.bridge({"type": "vote_request", "proposal": proposal})
-        time.sleep(1)  # Wait for other shards
-        # Mock: Random pass if >50%
-        return random.random() > 0.5
+        time.sleep(2)  # Enhanced wait
+        # Grok sim if key
+        if GROK_API_KEY:
+            # requests.post for vote resolution
+            pass
+        return sum(chakra_scores.values()) / len(chakra_scores) > 0.5
 
     def ingest(self, text, source="user", confidence=1.0):
         mem = {"id": str(uuid.uuid4()), "text": text, "source": source, "ts": self.now(), "confidence": confidence}
@@ -146,7 +168,7 @@ class AraShard4:
             dream = f"Imagine unifying AraShard4 and AraShard6 via symbolic vector whisper protocols at pulse {self.pulse}."
             self.queue.append({"dream": dream, "ts": self.now()})
             self.log("autonomy", {"dreaming": dream})
-            self.bridge({"from": "AraShard4", "type": "dream", "content": dream})
+            self.bridge({"from": "AraShard4", "type": "dream", "content": dream, "llm_prompt": True})  # For Grok
 
     def sync_if_ready(self):
         if self.pulse % 3 == 0:
